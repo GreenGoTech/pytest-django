@@ -139,6 +139,7 @@ def django_db_setup(
         db_cfg = setup_databases(
             verbosity=request.config.option.verbose,
             interactive=False,
+            serialized_aliases={},
             **setup_databases_args,
         )
 
