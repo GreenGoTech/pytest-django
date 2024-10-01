@@ -157,7 +157,7 @@ project by specifying a fixture with the same name and scope in ``conftest.py``.
 .. admonition:: Use the pytest-django source code
 
     The default implementation of these fixtures can be found in
-    `fixtures.py <https://github.com/pytest-dev/pytest-django/blob/master/pytest_django/fixtures.py>`_.
+    `fixtures.py <https://github.com/pytest-dev/pytest-django/blob/main/pytest_django/fixtures.py>`_.
 
     The code is relatively short and straightforward and can provide a
     starting point when you need to customize database setup in your own
@@ -325,16 +325,12 @@ Put this into ``conftest.py``::
     import pytest
     from django.db import connections
 
-    import psycopg2
-    from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+    import psycopg
 
 
     def run_sql(sql):
-        conn = psycopg2.connect(database='postgres')
-        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-        cur = conn.cursor()
-        cur.execute(sql)
-        conn.close()
+        with psycopg.connect(database='postgres') as conn:
+            conn.execute(sql)
 
 
     @pytest.fixture(scope='session')
@@ -370,6 +366,8 @@ Put this into ``conftest.py``::
 
     @pytest.fixture(scope='session')
     def django_db_setup():
+        from django.conf import settings
+
         settings.DATABASES['default'] = {
             'ENGINE': 'django.db.backends.mysql',
             'HOST': 'db.example.com',
@@ -503,7 +501,7 @@ Put this in ``conftest.py``::
 
 .. warning::
     This snippet shows ``cursor().executescript()`` which is `sqlite` specific, for
-    other database engines this method might differ. For instance, psycopg2 uses
+    other database engines this method might differ. For instance, psycopg uses
     ``cursor().execute()``.
 
 

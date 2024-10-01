@@ -1,4 +1,5 @@
 """All pytest-django fixtures"""
+
 from __future__ import annotations
 
 import os
@@ -94,22 +95,26 @@ def django_db_modify_db_settings_parallel_suffix(
 def django_db_modify_db_settings(
     django_db_modify_db_settings_parallel_suffix: None,
 ) -> None:
+    """Modify db settings just before the databases are configured."""
     skip_if_no_django()
 
 
 @pytest.fixture(scope="session")
 def django_db_use_migrations(request: pytest.FixtureRequest) -> bool:
+    """Return whether to use migrations to create the test databases."""
     return not request.config.getvalue("nomigrations")
 
 
 @pytest.fixture(scope="session")
 def django_db_keepdb(request: pytest.FixtureRequest) -> bool:
+    """Return whether to re-use an existing database and to keep it after the test run."""
     reuse_db: bool = request.config.getvalue("reuse_db")
     return reuse_db
 
 
 @pytest.fixture(scope="session")
 def django_db_createdb(request: pytest.FixtureRequest) -> bool:
+    """Return whether the database is to be re-created before running any tests."""
     create_db: bool = request.config.getvalue("create_db")
     return create_db
 
@@ -161,8 +166,6 @@ def _django_db_helper(
     django_db_setup: None,
     django_db_blocker: DjangoDbBlocker,
 ) -> Generator[None, None, None]:
-    from django import VERSION
-
     if is_django_unittest(request):
         yield
         return
@@ -195,74 +198,66 @@ def _django_db_helper(
         "django_db_serialized_rollback" in request.fixturenames
     )
 
-    django_db_blocker.unblock()
+    with django_db_blocker.unblock():
+        import django.db
+        import django.test
 
-    import django.db
-    import django.test
+        if transactional:
+            test_case_class = django.test.TransactionTestCase
+        else:
+            test_case_class = django.test.TestCase
 
-    if transactional:
-        test_case_class = django.test.TransactionTestCase
-    else:
-        test_case_class = django.test.TestCase
+        _reset_sequences = reset_sequences
+        _serialized_rollback = serialized_rollback
+        _databases = databases
+        _available_apps = available_apps
 
-    _reset_sequences = reset_sequences
-    _serialized_rollback = serialized_rollback
-    _databases = databases
-    _available_apps = available_apps
+        class PytestDjangoTestCase(test_case_class):  # type: ignore[misc,valid-type]
+            reset_sequences = _reset_sequences
+            serialized_rollback = _serialized_rollback
+            if _databases is not None:
+                databases = _databases
+            if _available_apps is not None:
+                available_apps = _available_apps
 
-    class PytestDjangoTestCase(test_case_class):  # type: ignore[misc,valid-type]
-        reset_sequences = _reset_sequences
-        serialized_rollback = _serialized_rollback
-        if _databases is not None:
-            databases = _databases
-        if _available_apps is not None:
-            available_apps = _available_apps
+            # For non-transactional tests, skip executing `django.test.TestCase`'s
+            # `setUpClass`/`tearDownClass`, only execute the super class ones.
+            #
+            # `TestCase`'s class setup manages the `setUpTestData`/class-level
+            # transaction functionality. We don't use it; instead we (will) offer
+            # our own alternatives. So it only adds overhead, and does some things
+            # which conflict with our (planned) functionality, particularly, it
+            # closes all database connections in `tearDownClass` which inhibits
+            # wrapping tests in higher-scoped transactions.
+            #
+            # It's possible a new version of Django will add some unrelated
+            # functionality to these methods, in which case skipping them completely
+            # would not be desirable. Let's cross that bridge when we get there...
+            if not transactional:
 
-        # For non-transactional tests, skip executing `django.test.TestCase`'s
-        # `setUpClass`/`tearDownClass`, only execute the super class ones.
-        #
-        # `TestCase`'s class setup manages the `setUpTestData`/class-level
-        # transaction functionality. We don't use it; instead we (will) offer
-        # our own alternatives. So it only adds overhead, and does some things
-        # which conflict with our (planned) functionality, particularly, it
-        # closes all database connections in `tearDownClass` which inhibits
-        # wrapping tests in higher-scoped transactions.
-        #
-        # It's possible a new version of Django will add some unrelated
-        # functionality to these methods, in which case skipping them completely
-        # would not be desirable. Let's cross that bridge when we get there...
-        if not transactional:
+                @classmethod
+                def setUpClass(cls) -> None:
+                    super(django.test.TestCase, cls).setUpClass()
 
-            @classmethod
-            def setUpClass(cls) -> None:
-                super(django.test.TestCase, cls).setUpClass()
-                if VERSION < (4, 1):
-                    django.db.transaction.Atomic._ensure_durability = False
+                @classmethod
+                def tearDownClass(cls) -> None:
+                    super(django.test.TestCase, cls).tearDownClass()
 
-            @classmethod
-            def tearDownClass(cls) -> None:
-                if VERSION < (4, 1):
-                    django.db.transaction.Atomic._ensure_durability = True
-                super(django.test.TestCase, cls).tearDownClass()
+        PytestDjangoTestCase.setUpClass()
 
-    PytestDjangoTestCase.setUpClass()
+        test_case = PytestDjangoTestCase(methodName="__init__")
+        test_case._pre_setup()
 
-    test_case = PytestDjangoTestCase(methodName="__init__")
-    test_case._pre_setup()
+        yield
 
-    yield
+        test_case._post_teardown()
 
-    test_case._post_teardown()
+        PytestDjangoTestCase.tearDownClass()
 
-    PytestDjangoTestCase.tearDownClass()
-
-    if VERSION >= (4, 0):
         PytestDjangoTestCase.doClassCleanups()
 
-    django_db_blocker.restore()
 
-
-def validate_django_db(marker) -> _DjangoDb:
+def validate_django_db(marker: pytest.Mark) -> _DjangoDb:
     """Validate the django_db marker.
 
     It checks the signature and creates the ``transaction``,
@@ -657,11 +652,13 @@ def _assert_num_queries(
 
 @pytest.fixture()
 def django_assert_num_queries(pytestconfig: pytest.Config) -> DjangoAssertNumQueries:
+    """Allows to check for an expected number of DB queries."""
     return partial(_assert_num_queries, pytestconfig)
 
 
 @pytest.fixture()
 def django_assert_max_num_queries(pytestconfig: pytest.Config) -> DjangoAssertNumQueries:
+    """Allows to check for an expected maximum number of DB queries."""
     return partial(_assert_num_queries, pytestconfig, exact=False)
 
 
@@ -679,6 +676,7 @@ class DjangoCaptureOnCommitCallbacks(Protocol):
 
 @pytest.fixture()
 def django_capture_on_commit_callbacks() -> DjangoCaptureOnCommitCallbacks:
+    """Captures transaction.on_commit() callbacks for the given database connection."""
     from django.test import TestCase
 
     return TestCase.captureOnCommitCallbacks  # type: ignore[no-any-return]

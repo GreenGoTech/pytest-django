@@ -3,6 +3,7 @@
 This plugin handles creating and destroying the test environment and
 test database and provides some useful text fixtures.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -475,6 +476,16 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     items.sort(key=get_order_number)
 
 
+def pytest_unconfigure(config: pytest.Config) -> None:
+    # Undo the block() in _setup_django(), if it happenned.
+    # It's also possible the user forgot to call restore().
+    # We can warn about it, but let's just clean it up.
+    if blocking_manager_key in config.stash:
+        blocking_manager = config.stash[blocking_manager_key]
+        while blocking_manager.is_active:
+            blocking_manager.restore()
+
+
 @pytest.fixture(autouse=True, scope="session")
 def django_test_environment(request: pytest.FixtureRequest) -> Generator[None, None, None]:
     """Setup Django's test environment for the testing session.
@@ -505,17 +516,26 @@ def django_test_environment(request: pytest.FixtureRequest) -> Generator[None, N
 
 @pytest.fixture(scope="session")
 def django_db_blocker(request: pytest.FixtureRequest) -> DjangoDbBlocker | None:
-    """Wrapper around Django's database access.
+    """Block or unblock database access.
 
-    This object can be used to re-enable database access.  This fixture is used
-    internally in pytest-django to build the other fixtures and can be used for
-    special database handling.
+    This is an advanced feature for implementing database fixtures.
 
-    The object is a context manager and provides the methods
-    .unblock()/.block() and .restore() to temporarily enable database access.
+    By default, pytest-django blocks access the the database. In tests which
+    request access to the database, the access is automatically unblocked.
 
-    This is an advanced feature that is meant to be used to implement database
-    fixtures.
+    In a test or fixture context where database access is blocked, you can
+    temporarily unblock access as follows::
+
+        with django_db_blocker.unblock():
+            ...
+
+    In a test or fixture context where database access is not blocked, you can
+    temporarily block access as follows::
+
+        with django_db_blocker.block():
+            ...
+
+    This fixture is also used internally by pytest-django.
     """
     if not django_settings_is_configured():
         return None
@@ -552,12 +572,21 @@ def _django_setup_unittest(
     def non_debugging_runtest(self) -> None:
         self._testcase(result=self)
 
+    from django.test import SimpleTestCase
+
+    assert issubclass(request.cls, SimpleTestCase)  # Guarded by 'is_django_unittest'
     try:
         TestCaseFunction.runtest = non_debugging_runtest  # type: ignore[method-assign]
 
-        request.getfixturevalue("django_db_setup")
+        # Don't set up the DB if the unittest does not require DB.
+        # The `databases` propery seems like the best indicator for that.
+        if request.cls.databases:
+            request.getfixturevalue("django_db_setup")
+            db_unblock = django_db_blocker.unblock()
+        else:
+            db_unblock = contextlib.nullcontext()
 
-        with django_db_blocker.unblock():
+        with db_unblock:
             yield
     finally:
         TestCaseFunction.runtest = original_runtest  # type: ignore[method-assign]
@@ -578,6 +607,7 @@ def mailoutbox(
     django_mail_patch_dns: None,
     _dj_autoclear_mailbox: None,
 ) -> list[django.core.mail.EmailMessage] | None:
+    """A clean email outbox to which Django-generated emails are sent."""
     if not django_settings_is_configured():
         return None
 
@@ -591,6 +621,7 @@ def django_mail_patch_dns(
     monkeypatch: pytest.MonkeyPatch,
     django_mail_dnsname: str,
 ) -> None:
+    """Patch the server dns name used in email messages."""
     from django.core import mail
 
     monkeypatch.setattr(mail.message, "DNS_NAME", django_mail_dnsname)
@@ -598,13 +629,14 @@ def django_mail_patch_dns(
 
 @pytest.fixture()
 def django_mail_dnsname() -> str:
+    """Return server dns name for using in email messages."""
     return "fake-tests.example.com"
 
 
 @pytest.fixture(autouse=True)
 def _django_set_urlconf(request: pytest.FixtureRequest) -> Generator[None, None, None]:
     """Apply the @pytest.mark.urls marker, internal to pytest-django."""
-    marker = request.node.get_closest_marker("urls")
+    marker: pytest.Mark | None = request.node.get_closest_marker("urls")
     if marker:
         skip_if_no_django()
         import django.conf
@@ -627,7 +659,7 @@ def _django_set_urlconf(request: pytest.FixtureRequest) -> Generator[None, None,
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _fail_for_invalid_template_variable():
+def _fail_for_invalid_template_variable() -> Generator[None, None, None]:
     """Fixture that fails for invalid variables in templates.
 
     This fixture will fail each test that uses django template rendering
@@ -644,8 +676,9 @@ def _fail_for_invalid_template_variable():
     class InvalidVarException:
         """Custom handler for invalid strings in templates."""
 
-        def __init__(self) -> None:
+        def __init__(self, *, origin_value: str) -> None:
             self.fail = True
+            self.origin_value = origin_value
 
         def __contains__(self, key: str) -> bool:
             return key == "%s"
@@ -656,13 +689,11 @@ def _fail_for_invalid_template_variable():
 
             # Try to use topmost `self.origin` first (Django 1.9+, and with
             # TEMPLATE_DEBUG)..
-            for f in stack[2:]:
-                func = f[3]
-                if func == "render":
-                    frame = f[0]
+            for frame_info in stack[2:]:
+                if frame_info.function == "render":
                     origin: str | None
                     try:
-                        origin = frame.f_locals["self"].origin
+                        origin = frame_info.frame.f_locals["self"].origin
                     except (AttributeError, KeyError):
                         origin = None
                     if origin is not None:
@@ -672,16 +703,10 @@ def _fail_for_invalid_template_variable():
 
             # finding the ``render`` needle in the stack
             frameinfo = reduce(
-                lambda x, y: y[3] == "render" and "base.py" in y[1] and y or x, stack
+                lambda x, y: y if y.function == "render" and "base.py" in y.filename else x, stack
             )
-            # assert 0, stack
-            frame = frameinfo[0]
-            # finding only the frame locals in all frame members
-            f_locals = reduce(
-                lambda x, y: y[0] == "f_locals" and y or x, inspect.getmembers(frame)
-            )[1]
             # ``django.template.base.Template``
-            template = f_locals["self"]
+            template = frameinfo.frame.f_locals["self"]
             if isinstance(template, Template):
                 name: str = template.name
                 return name
@@ -696,7 +721,7 @@ def _fail_for_invalid_template_variable():
             if self.fail:
                 pytest.fail(msg)
             else:
-                return msg
+                return self.origin_value
 
     with pytest.MonkeyPatch.context() as mp:
         if (
@@ -709,7 +734,11 @@ def _fail_for_invalid_template_variable():
                 mp.setitem(
                     dj_settings.TEMPLATES[0]["OPTIONS"],
                     "string_if_invalid",
-                    InvalidVarException(),
+                    InvalidVarException(
+                        origin_value=dj_settings.TEMPLATES[0]["OPTIONS"].get(
+                            "string_if_invalid", ""
+                        )
+                    ),
                 )
         yield
 
@@ -788,8 +817,8 @@ class DjangoDbBlocker:
     def _dj_db_wrapper(self) -> django.db.backends.base.base.BaseDatabaseWrapper:
         from django.db.backends.base.base import BaseDatabaseWrapper
 
-        # The first time the _dj_db_wrapper is accessed, we will save a
-        # reference to the real implementation.
+        # The first time the _dj_db_wrapper is accessed, save a reference to the
+        # real implementation.
         if self._real_ensure_connection is None:
             self._real_ensure_connection = BaseDatabaseWrapper.ensure_connection
 
@@ -819,14 +848,24 @@ class DjangoDbBlocker:
         return _DatabaseBlockerContextManager(self)
 
     def restore(self) -> None:
+        """Undo a previous call to block() or unblock().
+
+        Consider using block() and unblock() as context managers instead of
+        manually calling restore().
+        """
         self._dj_db_wrapper.ensure_connection = self._history.pop()
+
+    @property
+    def is_active(self) -> bool:
+        """Whether a block() or unblock() is currently active."""
+        return bool(self._history)
 
 
 # On Config.stash.
 blocking_manager_key = pytest.StashKey[DjangoDbBlocker]()
 
 
-def validate_urls(marker) -> list[str]:
+def validate_urls(marker: pytest.Mark) -> list[str]:
     """Validate the urls marker.
 
     It checks the signature and creates the `urls` attribute on the
